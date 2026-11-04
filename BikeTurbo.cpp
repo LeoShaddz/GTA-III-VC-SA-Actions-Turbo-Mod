@@ -1,26 +1,28 @@
 // BikeTurbo.asi - GTA San Andreas PC v1.0 (US)
 //
-// Type BIKETURBO during gameplay to toggle the "bicycle turbo" on/off. It does not use the
-// game's cheat system (custom input buffer; it does not count as a cheat or disable achievements/saves).
-// When enabled, holding W (or the controller's accelerate button, e.g., A) while riding a BICYCLE
-// makes the game register repeated button presses (actual state changes in CPad).
+// Digitar BIKETURBO durante o jogo liga/desliga o "turbo de bicicleta". Nao usa o sistema de
+// cheats do jogo (buffer proprio; nao conta como cheat usado nem desativa conquistas/saves).
+// Ligado, segurar W (ou o botao de acelerar do controle, ex.: A) em cima de uma BICICLETA faz o
+// jogo registrar o botao sendo apertado varias vezes seguidas (toques reais no estado do CPad).
 //
-// Everything below has been verified in gta_sa.exe v1.0 US:
-//  - CHud::SetHelpMessage = 0x588BE0 (cdecl: text, quick, permanent, addToBrief). This is the same
-//    function the game uses to display the cheat activation message (called with 1,0,0). The help
-//    box plays the original sound (frontend event 0x20) when the message appears.
-//  - CHud::DrawHelpMessage = 0x58B6E0, called once per frame at 0x58FCFA (CHud::Draw).
-//    The plugin intercepts this call to display the message on the game's main thread.
-//  - CGame::Process = 0x53BEE0. Its first call (0x53BEE6) is CPad::UpdatePads (0x541DD0),
-//    which reads the keyboard/controller (including GInput) and updates the CPad state every frame.
-//    The plugin intercepts this call: immediately after the game updates CPad, and BEFORE any
-//    character/vehicle is processed, the accelerate button (ButtonCross, CPad+0x20,
-//    which corresponds to W on the keyboard) is "released" on alternating frames. This way, the
-//    game registers actual button presses (pressed now / was not pressed before), rather than
-//    just a continuous value.
-//  - CTimer::m_FrameCounter = 0xB7CB4C (game frame counter; it does not advance while paused).
-//  - Player CPad (pad 0) = 0xB73458. Bicycle = vehicle+0x594 == 10 (BMX).
-//    Player vehicle: FindPlayerVehicle 0x56E0D0.
+// NOVO: opcao "Bike Turbo" no menu Controller Setup (abaixo de Mouse Settings), Yes/No, que
+// liga/desliga o mesmo turbo. Textos customizaveis no .ini (com suporte a caracteres como s-caron).
+//
+// Confirmado no gta_sa.exe 1.0 US (versao original do mod):
+//  - CHud::SetHelpMessage = 0x588BE0 (cdecl: texto, quick, permanent, addToBrief).
+//  - CHud::DrawHelpMessage = 0x58B6E0, chamada uma vez por frame em 0x58FCFA (CHud::Draw).
+//  - CGame::Process = 0x53BEE0. Sua primeira chamada (0x53BEE6) e CPad::UpdatePads (0x541DD0).
+//  - CTimer::m_FrameCounter = 0xB7CB4C. CPad do jogador (pad 0) = 0xB73458.
+//    Bicicleta = veiculo+0x594 == 10 (BMX). Veiculo do jogador: FindPlayerVehicle 0x56E0D0.
+//
+// Enderecos do MENU (NAO testados neste exe: vem do plugin-sdk / gta-reversed; o mod confere tudo
+// antes de alterar qualquer coisa e escreve o resultado no BikeTurbo.log quando Log = 1):
+//  - FrontEndMenuManager = 0xBA6748. Campos: +0x54 item selecionado (int), +0x5C menu ativo (byte),
+//    +0x15D pagina atual (char).
+//  - aScreens = 0x8CE008, cada tela CMenuScreen tem 0xE2 bytes: nome[8], tela anterior, entrada pai,
+//    e 12 entradas de 18 bytes (acao, chave de texto[8], slot, tela destino, pad, X, Y, alinhamento).
+//  - CMenuManager::DrawStandardMenu = 0x5794A0. CText::Get (thiscall) = 0x6A0050: as chamadas a ela
+//    dentro do desenho do menu sao trocadas por um filtro que devolve o texto da nossa opcao.
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -42,21 +44,70 @@ static const uintptr_t FN_FINDVEH    = 0x56E0D0;
 static const int       OFF_SUBCLASS  = 0x594;
 static const int       SUBCLASS_BMX  = 10;
 
+// ---- Menu ----
+static const uintptr_t FEM_ADDR      = 0xBA6748;   // FrontEndMenuManager
+static const int       FEM_SELECTED  = 0x54;       // int  : entrada selecionada
+static const int       FEM_ACTIVE    = 0x5C;       // byte : menu aberto
+static const int       FEM_PAGE      = 0x15D;      // char : pagina atual
+static const uintptr_t ASCREENS_ADDR = 0x8CE008;   // CMenuScreen aScreens[]
+static const int       MAX_SCREENS   = 44;          // telas validas de aScreens (depois delas ha lixo)
+static const uintptr_t FN_DRAWSTD    = 0x5794A0;   // CMenuManager::DrawStandardMenu
+static const size_t    DRAWSTD_SCAN  = 0x3800;     // area varrida atras de chamadas a CText::Get
+static const uintptr_t FN_TEXTGET    = 0x6A0050;   // CText::Get (thiscall)
+
+#pragma pack(push, 2)
+struct MenuEntry {
+    uint8_t  action;
+    char     name[8];
+    uint8_t  slot;
+    int8_t   target;
+    uint8_t  pad;
+    uint16_t x;
+    uint16_t y;
+    uint8_t  align;
+    uint8_t  pad2;
+};
+struct MenuScreen {
+    char      name[8];
+    int8_t    prev;
+    int8_t    parent;
+    MenuEntry e[12];
+};
+#pragma pack(pop)
+static_assert(sizeof(MenuEntry) == 18, "MenuEntry deve ter 18 bytes");
+static_assert(sizeof(MenuScreen) == 0xE2, "MenuScreen deve ter 0xE2 bytes");
+
 typedef void  (__cdecl   *SetHelp_t)(const char* text, int quick, int permanent, int brief);
 typedef void* (__cdecl   *FindVeh_t)(int player, int remote);
 typedef void  (__cdecl   *Void_t)();
+typedef char* (__thiscall *TextGet_t)(void* self, const char* key);
 
 static HMODULE hSelf = NULL;
 static char    gIni[MAX_PATH];
 static bool    gLog = false;
 
-static char    gCode[24]   = "BIKETURBO";
-static char    gTextOn[64] = "Bike Turbo On";
+static char    gCode[24]    = "BIKETURBO";
+static char    gTextOn[64]  = "Bike Turbo On";
 static char    gTextOff[64] = "Bike Turbo Off";
-static unsigned gHalfFrames = 1;       // Number of "pressed" / "released" frames per tap
+static unsigned gHalfFrames = 1;       // frames "apertado" / frames "solto" em cada toque
 
 static volatile bool gOn      = false;
-static volatile int  gPending = 0;     // 0 = none, 1 = display "On", 2 = display "Off"
+static volatile int  gPending = 0;     // 0 nada, 1 mostrar "On", 2 mostrar "Off"
+
+// ---- Menu: configuracao e estado ----
+static char    gMenuText[96] = "Bike Turbo";
+static char    gMenuYes[32]  = "Yes";
+static char    gMenuNo[32]   = "No";
+static char    gMenuFmt[96]  = "{text}: {value}";
+static int     gMenuAction   = 254;            // acao da nova entrada (5 = a mesma de "Redefine Controls": o jogo sabe desenhar)
+static const char gMenuKey[8] = "BKTURBO";   // chave de texto da nossa entrada (7 letras + NUL)
+static volatile bool gMenuReady = false;
+static int     gMenuStep     = 30;           // espaco automatico entre linhas (y=0 = "logo abaixo"): 72 px a 1080p
+static int     gCtrlPage     = -1;           // indice da tela Controller Setup em aScreens
+static const int FEM_NUMOPTS = 0x1B21;       // byte : quantidade de opcoes da pagina atual
+static TextGet_t gOrigGet    = NULL;
+static volatile int gTextAsks = 0;           // quantas vezes o jogo pediu o texto da nossa linha (ela foi desenhada)
+static const int OFF_DPAD_LEFT = 0x14, OFF_DPAD_RIGHT = 0x16;   // CControllerState: DPadLeft / DPadRight
 
 static void Log(const char* fmt, ...)
 {
@@ -81,22 +132,459 @@ static bool GameFocused()
     return pid == GetCurrentProcessId();
 }
 
-// ---------------- Typed code detection (separate thread) ----------------
+// ---------------- Estado salvo (BikeTurbo.sav ao lado do .asi: "1" ou "0") ----------------
+static bool gSaveChoice = true;
+
+static bool StatePath(char* path)
+{
+    if (!GetModuleFileNameA(hSelf, path, MAX_PATH)) return false;
+    char* dot = strrchr(path, '.');
+    if (dot) strcpy(dot, ".sav"); else strcat(path, ".sav");
+    return true;
+}
+
+static bool LoadState(bool& on)
+{
+    char path[MAX_PATH];
+    if (!StatePath(path)) return false;
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    int c = fgetc(f);
+    fclose(f);
+    if (c != '0' && c != '1') return false;
+    on = (c == '1');
+    return true;
+}
+
+// Muda o estado do turbo (menu, codigo digitado, Restore Defaults) e grava a escolha
+static void SetOn(bool v)
+{
+    if (gOn == v) return;
+    gOn = v;
+    if (!gSaveChoice) return;
+    char path[MAX_PATH];
+    if (!StatePath(path)) return;
+    FILE* f = fopen(path, "w");
+    if (f) { fputc(v ? '1' : '0', f); fclose(f); }
+}
+
+// ---------------- INI proprio (aceita UTF-8 com ou sem BOM) ----------------
+static char*  gIniData = NULL;
+static size_t gIniLen  = 0;
+
+static void IniLoad(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > (1 << 20)) { fclose(f); return; }
+    gIniData = (char*)malloc((size_t)n + 1);
+    if (!gIniData) { fclose(f); return; }
+    gIniLen = fread(gIniData, 1, (size_t)n, f);
+    fclose(f);
+    gIniData[gIniLen] = 0;
+    if (gIniLen >= 3 && (uint8_t)gIniData[0] == 0xEF && (uint8_t)gIniData[1] == 0xBB && (uint8_t)gIniData[2] == 0xBF)
+    {
+        memmove(gIniData, gIniData + 3, gIniLen - 2);   // inclui o NUL final
+        gIniLen -= 3;
+    }
+}
+
+typedef bool (*IniCb)(const char* sec, const char* key, const char* val, void* ctx);   // false = parar
+
+static void IniEach(IniCb cb, void* ctx)
+{
+    if (!gIniData) return;
+    char sec[64] = "";
+    const char* p = gIniData;
+    const char* end = gIniData + gIniLen;
+    while (p < end)
+    {
+        const char* e = p;
+        while (e < end && *e != '\n' && *e != '\r') ++e;
+        size_t len = (size_t)(e - p);
+        char line[512];
+        if (len > sizeof(line) - 1) len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = 0;
+        p = e;
+        while (p < end && (*p == '\n' || *p == '\r')) ++p;
+
+        char* s = line;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (!*s || *s == ';' || *s == '#') continue;
+        if (*s == '[')
+        {
+            char* q = strchr(s, ']');
+            if (q) { *q = 0; strncpy(sec, s + 1, sizeof(sec) - 1); sec[sizeof(sec) - 1] = 0; }
+            continue;
+        }
+        char* eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* kend = eq;
+        while (kend > s && (kend[-1] == ' ' || kend[-1] == '\t')) --kend;
+        *kend = 0;
+        char* val = eq + 1;
+        while (*val == ' ' || *val == '\t') ++val;
+        char* vend = val + strlen(val);
+        while (vend > val && (vend[-1] == ' ' || vend[-1] == '\t')) --vend;
+        *vend = 0;
+        if (!cb(sec, s, val, ctx)) return;
+    }
+}
+
+struct IniGetCtx { const char* sec; const char* key; char* out; size_t cap; bool found; };
+static bool IniGetCb(const char* sec, const char* key, const char* val, void* ctx)
+{
+    IniGetCtx* c = (IniGetCtx*)ctx;
+    if (_stricmp(sec, c->sec) != 0 || _stricmp(key, c->key) != 0) return true;
+    strncpy(c->out, val, c->cap - 1);
+    c->out[c->cap - 1] = 0;
+    c->found = true;
+    return false;
+}
+static bool IniGet(const char* sec, const char* key, char* out, size_t cap)
+{
+    IniGetCtx c = { sec, key, out, cap, false };
+    IniEach(IniGetCb, &c);
+    return c.found;
+}
+static int IniInt(const char* key, int def)
+{
+    char b[32];
+    if (!IniGet("BikeTurbo", key, b, sizeof b) || !b[0]) return def;
+    return atoi(b);
+}
+
+// ---------------- Texto do .ini (UTF-8 ou ANSI) -> bytes que o jogo entende ----------------
+struct CharMapEnt { uint32_t cp; uint8_t b; };
+static CharMapEnt gMap[64];
+static int        gMapN = 0;
+static UINT       gCodePage = 1252;
+
+static int Utf8Next(const uint8_t*& p, uint32_t& cp)   // 1 = ok, 0 = UTF-8 invalido
+{
+    uint8_t c = *p;
+    if (c < 0x80) { cp = c; ++p; return 1; }
+    int n; uint32_t v;
+    if      ((c & 0xE0) == 0xC0) { n = 1; v = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { n = 2; v = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { n = 3; v = c & 0x07; }
+    else return 0;
+    for (int i = 1; i <= n; ++i)
+    {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        v = (v << 6) | (p[i] & 0x3F);
+    }
+    p += n + 1;
+    cp = v;
+    return 1;
+}
+
+static void ToGame(const char* in, char* out, size_t cap)
+{
+    size_t k = 0;
+    bool utf8 = true, hi = false;
+    for (const uint8_t* p = (const uint8_t*)in; *p; )
+    {
+        uint32_t cp;
+        if (*p >= 0x80) hi = true;
+        if (!Utf8Next(p, cp)) { utf8 = false; break; }
+    }
+    if (!utf8 || !hi)                       // ASCII puro ou arquivo ANSI: bytes passam como estao
+    {
+        for (const char* s = in; *s && k + 1 < cap; ++s) out[k++] = *s;
+        out[k] = 0;
+        return;
+    }
+    for (const uint8_t* p = (const uint8_t*)in; *p && k + 1 < cap; )
+    {
+        uint32_t cp = 0;
+        Utf8Next(p, cp);
+        if (cp < 0x80) { out[k++] = (char)cp; continue; }
+        bool done = false;
+        for (int i = 0; i < gMapN; ++i)
+            if (gMap[i].cp == cp) { out[k++] = (char)gMap[i].b; done = true; break; }
+        if (done) continue;
+        if (cp <= 0xFFFF)
+        {
+            WCHAR w = (WCHAR)cp;
+            char b = '?';
+            BOOL usedDef = FALSE;
+            if (WideCharToMultiByte(gCodePage, 0, &w, 1, &b, 1, "?", &usedDef) == 1 && !usedDef) { out[k++] = b; continue; }
+        }
+        out[k++] = '?';
+    }
+    out[k] = 0;
+}
+
+static bool CharMapCb(const char* sec, const char* key, const char* val, void*)
+{
+    if (_stricmp(sec, "CharMap") != 0 || gMapN >= 64) return true;
+    uint32_t cp = 0;
+    if ((key[0] == 'U' || key[0] == 'u') && key[1] == '+') cp = (uint32_t)strtoul(key + 2, NULL, 16);
+    else { const uint8_t* p = (const uint8_t*)key; if (!Utf8Next(p, cp)) return true; }
+    long b = strtol(val, NULL, 0);
+    if (cp < 0x80 || b < 1 || b > 255) return true;
+    gMap[gMapN].cp = cp;
+    gMap[gMapN].b = (uint8_t)b;
+    ++gMapN;
+    return true;
+}
+
+static void ReadText(const char* key, const char* def, char* out, size_t cap)
+{
+    char raw[256];
+    if (!IniGet("BikeTurbo", key, raw, sizeof raw)) { strncpy(raw, def, sizeof raw - 1); raw[sizeof raw - 1] = 0; }
+    ToGame(raw, out, cap);
+}
+
+// Monta o texto da nossa linha do menu (reflete o estado atual: Yes/No)
+static void BuildLabel(char* out, size_t cap)
+{
+    const char* val = gOn ? gMenuYes : gMenuNo;
+    const char* f = gMenuFmt;
+    size_t k = 0;
+    while (*f && k + 1 < cap)
+    {
+        if (strncmp(f, "{text}", 6) == 0)       { for (const char* s = gMenuText; *s && k + 1 < cap; ) out[k++] = *s++; f += 6; }
+        else if (strncmp(f, "{value}", 7) == 0) { for (const char* s = val;       *s && k + 1 < cap; ) out[k++] = *s++; f += 7; }
+        else out[k++] = *f++;
+    }
+    out[k] = 0;
+}
+
+// ---------------- Tabelas do menu e cliques (thread propria, mesma do codigo digitado) ----------------
+// Outro mod pode manter uma COPIA das telas no heap (e o jogo desenha por ela, nao pela tabela do .exe).
+// gLive = base dessa copia (indice = numero da tela). Sem copia, usa a tabela do .exe.
+static MenuScreen* gLive = NULL;
+static volatile int gKeepSel = -1;           // item a recolocar se o jogo recarregar a tela depois do clique
+static volatile DWORD gKeepUntil = 0;
+
+static MenuScreen* ActiveBase() { return gLive ? gLive : (MenuScreen*)ASCREENS_ADDR; }
+static bool KeyIs(const MenuEntry& e, const char* key) { return strncmp(e.name, key, 8) == 0; }
+static int CountEntries(const MenuScreen& s) { int n = 0; while (n < 12 && s.e[n].action != 0) ++n; return n; }
+
+// Entrada que o jogo considera "item sel" da tela: compara a quantidade de entradas da tabela com a quantidade
+// que o proprio jogo informa (algumas telas tem uma primeira linha de rotulo que nao conta como item).
+static const MenuEntry* EntryAt(int page, int sel, int cnt)
+{
+    if (page < 0 || page >= MAX_SCREENS) return NULL;
+    const MenuScreen& s = ActiveBase()[page];
+    const int n = CountEntries(s);
+    (void)cnt;                                // o log mostrou: o item N do jogo e a entrada N da tabela (o rotulo conta)
+    const int i = sel;
+    return (i >= 0 && i < n) ? &s.e[i] : NULL;
+}
+
+static void DumpScreen(int i, const MenuScreen& s);
+
+// "Yes" da tela de confirmacao: a entrada FEM_YES e a ultima da tabela, entao e o ultimo item do jogo
+// (funciona com ou sem a linha de rotulo da tela e mesmo que a numeracao dos itens seja diferente).
+static bool IsYesItem(int conf, int sel, int /*cnt*/, const MenuEntry* e)
+{
+    if (e && KeyIs(*e, "FEM_YES")) return true;
+    const MenuScreen& s = ActiveBase()[conf];
+    const int n = CountEntries(s);
+    return n > 0 && KeyIs(s.e[n - 1], "FEM_YES") && sel == n - 1;
+}
+
+// Trata um "clique": page/sel = onde o menu estava um instante ANTES do clique (o jogo pode ja ter reagido).
+// arrow = seta esquerda/direita ou direcional: so alterna a nossa linha.
+static void MenuClick(int page, int sel, int cnt, bool arrow)
+{
+    if (!gMenuReady || gCtrlPage < 0) return;
+    const MenuEntry* e = EntryAt(page, sel, cnt);
+
+    // tela de confirmacao do Restore Defaults = destino da linha FET_DEF da tela Controller Setup
+    int conf = -1;
+    const MenuScreen& cs = ActiveBase()[gCtrlPage];
+    for (int k = 0; k < 12 && cs.e[k].action; ++k) if (KeyIs(cs.e[k], "FET_DEF")) conf = (int)(uint8_t)cs.e[k].target;
+
+    if (page == gCtrlPage || (page == conf && conf >= 0))
+    {
+        Log("Menu: %s na pagina %d, item %d (opcoes no jogo: %d), chave \"%.8s\"", arrow ? "seta" : "clique", page, sel,
+            cnt, e ? e->name : "(nenhuma)");
+        if (page == conf && gLog) DumpScreen(conf, ActiveBase()[conf]);
+    }
+
+    if (page == gCtrlPage && e && KeyIs(*e, gMenuKey))
+    {
+        SetOn(!gOn);
+        if (e->action == 5) { gKeepSel = sel; gKeepUntil = GetTickCount() + 400; }  // acao 5 recarrega a tela: recoloca o item
+        Log("Menu: Bike Turbo -> %s", gOn ? "Yes" : "No");
+    }
+    else if (!arrow && conf >= 0 && page == conf && IsYesItem(conf, sel, cnt, e))
+    {
+        SetOn(false);                                                               // Restore Defaults confirmado: volta para No
+        Log("Menu: Restore Defaults confirmado -> Bike Turbo = No");
+    }
+}
+
+// ---------------- Roda do mouse: alterna a nossa linha (e nao deixa o jogo mover a selecao) ----------------
+static LRESULT CALLBACK MouseLL(int code, WPARAM w, LPARAM l)
+{
+    if (code == HC_ACTION && w == WM_MOUSEWHEEL && gMenuReady && gCtrlPage >= 0 && GameFocused() &&
+        *(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE))
+    {
+        const int page = *(volatile int8_t*)(FEM_ADDR + FEM_PAGE);
+        const int sel  = *(volatile int*)(FEM_ADDR + FEM_SELECTED);
+        const MenuEntry* e = EntryAt(page, sel, 0);
+        if (page == gCtrlPage && e && KeyIs(*e, gMenuKey))
+        {
+            SetOn(!gOn);
+            Log("Menu: roda do mouse -> Bike Turbo = %s", gOn ? "Yes" : "No");
+            return 1;                                           // engole o evento
+        }
+    }
+    return CallNextHookEx(NULL, code, w, l);
+}
+
+static DWORD WINAPI WheelThread(LPVOID)
+{
+    HHOOK h = SetWindowsHookExA(WH_MOUSE_LL, MouseLL, GetModuleHandleA(NULL), 0);
+    if (!h) { Log("Menu: nao consegui instalar o gancho da roda do mouse (erro %lu).", GetLastError()); return 0; }
+    MSG m;
+    while (GetMessageA(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageA(&m); }
+    return 0;
+}
+
+static void DumpScreen(int i, const MenuScreen& s);
+
+// Diagnostico: procura na memoria do processo o texto de uma chave (ex.: "FEC_MOU") e mostra os bytes em volta
+static void ScanKey(const char* key)
+{
+    const size_t kl = strlen(key) + 1;                    // com o NUL final
+    const uintptr_t selfLo = (uintptr_t)hSelf;
+    int hits = 0;
+    uintptr_t a = 0x10000;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (a < 0x7FFE0000 && hits < 12 && VirtualQuery((void*)a, &mbi, sizeof mbi) == sizeof mbi)
+    {
+        uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
+        const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                              (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        if (readable && !(lo <= selfLo && selfLo < hi) && !(selfLo <= lo && lo < selfLo + 0x200000))
+        {
+            const uint8_t* p = (const uint8_t*)lo;
+            for (size_t i = 0; i + kl <= mbi.RegionSize && hits < 12; ++i)
+            {
+                if (p[i] != (uint8_t)key[0] || memcmp(p + i, key, kl) != 0) continue;
+                ++hits;
+                char hex[200]; size_t o = 0;
+                const uintptr_t at = lo + i;
+                const uintptr_t from = (at >= lo + 20) ? at - 20 : lo;
+                for (uintptr_t q = from; q < at + 40 && q < hi && o + 4 < sizeof hex; ++q)
+                    o += (size_t)sprintf(hex + o, "%02X ", *(const uint8_t*)q);
+                Log("Scan \"%s\" em 0x%08X (regiao 0x%08X-0x%08X, prot=0x%X). Bytes desde 0x%08X: %s",
+                    key, (unsigned)at, (unsigned)lo, (unsigned)hi, (unsigned)mbi.Protect, (unsigned)from, hex);
+            }
+        }
+        if (hi <= a) break;
+        a = hi;
+    }
+    Log("Scan \"%s\": %d ocorrencia(s)", key, hits);
+}
+
+// Diagnostico (Log = 1): anota cada mudanca de pagina / item no menu
+static void PatchTable(MenuScreen* S, int found);
+static MenuScreen* FindLive();
+
+// Garante que a copia do jogo (se existir) tambem tenha a nossa linha, e reaplica se alguem a refizer.
+static void EnsureLive()
+{
+    static DWORD lastScan = 0;
+    if (gCtrlPage < 0 || !*(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE)) return;
+    if (gLive)
+    {
+        if (IsBadReadPtr(gLive + gCtrlPage, sizeof(MenuScreen)) || strncmp(gLive[gCtrlPage].name, "FET_CTL", 8) != 0)
+        { Log("Menu: a copia das telas sumiu; procurando de novo."); gLive = NULL; return; }
+        PatchTable(gLive, gCtrlPage);                     // so age se a linha nao estiver la
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (now - lastScan < 1000) return;
+    lastScan = now;
+    MenuScreen* L = FindLive();
+    if (L)
+    {
+        Log("Menu: copia das telas do jogo encontrada em 0x%08X (tela %d em 0x%08X)", (unsigned)(uintptr_t)L, gCtrlPage, (unsigned)(uintptr_t)&L[gCtrlPage]);
+        gLive = L;
+        PatchTable(gLive, gCtrlPage);
+    }
+}
+
+static void MenuWatch()
+{
+    static int lastPage = -999, lastSel = -999, lines = 0, dumps = 0;
+    static DWORD enterTick = 0; static int asksAtEnter = 0; static bool fellBack = false;
+    if (!gLog || lines > 300) return;
+    if (!*(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE)) { lastPage = lastSel = -999; return; }
+    const int page = *(volatile int8_t*)(FEM_ADDR + FEM_PAGE);
+    const int sel  = *(volatile int*)(FEM_ADDR + FEM_SELECTED);
+    if (gKeepSel >= 0)
+    {
+        if ((int)(GetTickCount() - gKeepUntil) > 0) gKeepSel = -1;
+        else if (page == gCtrlPage && sel == 0 && gKeepSel != 0) { *(volatile int*)(FEM_ADDR + FEM_SELECTED) = gKeepSel; Log("Menu: item %d recolocado", (int)gKeepSel); gKeepSel = -1; return; }
+    }
+    if (page == gCtrlPage && page != lastPage) { enterTick = GetTickCount(); asksAtEnter = gTextAsks; }
+    if (page == gCtrlPage && !fellBack && enterTick && GetTickCount() - enterTick > 1200 && gTextAsks == asksAtEnter)
+    {
+        // o jogo nao desenhou a linha com essa acao: usa a 5 (a de Redefine Controls), que ele sempre desenha
+        fellBack = true;
+        MenuScreen* tabs[2] = { (MenuScreen*)ASCREENS_ADDR, gLive };
+        for (int t = 0; t < 2; ++t)
+        {
+            if (!tabs[t]) continue;
+            MenuScreen& sc = tabs[t][gCtrlPage];
+            for (int k = 0; k < 12 && sc.e[k].action; ++k)
+                if (KeyIs(sc.e[k], gMenuKey) && sc.e[k].action != 5)
+                {
+                    DWORD old, tmp;
+                    VirtualProtect(&sc.e[k], sizeof(MenuEntry), PAGE_READWRITE, &old);
+                    sc.e[k].action = 5;
+                    VirtualProtect(&sc.e[k], sizeof(MenuEntry), old, &tmp);
+                    Log("Menu: a linha nao foi desenhada com a acao %d; trocada para a acao 5.", gMenuAction);
+                }
+        }
+        gMenuAction = 5;
+    }
+    if (page == gCtrlPage && page != lastPage && dumps < 3)
+    {
+        ++dumps;
+        Log("Menu: tabela da tela %d agora (para ver se o jogo a refez):", page);
+        DumpScreen(page, ActiveBase()[page]);
+    }
+    if (page != lastPage || sel != lastSel)
+    {
+        lastPage = page; lastSel = sel; ++lines;
+        Log("Menu: pagina=%d item=%d opcoes=%d", page, sel, (int)*(volatile uint8_t*)(FEM_ADDR + FEM_NUMOPTS));
+    }
+}
+
+// ---------------- Deteccao do texto digitado (thread propria) ----------------
 static DWORD WINAPI KeyThread(LPVOID)
 {
     const int len = (int)strlen(gCode);
     char  buf[32] = { 0 };
     int   n = 0;
     bool  prev[26] = { false };
+    bool  prevEnter = false, prevLmb = false, prevCross = false, prevL = false, prevR = false;
     DWORD last = 0;
+    struct Snap { DWORD t; int page, sel, cnt; } hist[16] = {};
+    int   histN = 0;
 
     for (;;)
     {
         Sleep(4);
-        if (!GameFocused()) { for (int i = 0; i < 26; i++) prev[i] = false; continue; }
+        if (!GameFocused()) { for (int i = 0; i < 26; i++) prev[i] = false; prevEnter = prevLmb = prevCross = prevL = prevR = false; continue; }
 
         DWORD now = GetTickCount();
-        if (n > 0 && now - last > 4000) n = 0;                // Long pause: reset input buffer
+        if (n > 0 && now - last > 4000) n = 0;                // pausa longa: recomeca
 
         for (int i = 0; i < 26; i++)
         {
@@ -109,27 +597,62 @@ static DWORD WINAPI KeyThread(LPVOID)
                 last = now;
                 if (n == len && memcmp(buf, gCode, len) == 0)
                 {
-                    gOn = !gOn;
+                    SetOn(!gOn);
                     gPending = gOn ? 1 : 2;
                     n = 0; buf[0] = 0;
-                    Log("Turbo %s", gOn ? "ENABLED" : "DISABLED");
+                    Log("Turbo %s", gOn ? "LIGADO" : "DESLIGADO");
                 }
             }
             prev[i] = down;
+        }
+
+        if (gMenuReady)
+        {
+            EnsureLive();
+            MenuWatch();
+            const bool active = *(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE) != 0;
+            const int  page   = *(volatile int8_t*)(FEM_ADDR + FEM_PAGE);
+            const int  sel    = *(volatile int*)(FEM_ADDR + FEM_SELECTED);
+            const int cntNow = (int)*(volatile uint8_t*)(FEM_ADDR + FEM_NUMOPTS);
+            hist[histN++ & 15] = { now, page, sel, cntNow };
+
+            const bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+            const bool lmb   = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            const bool cross = *(volatile short*)(PAD0 + OFF_CROSS) > 0;                       // A / X do controle
+            const bool left  = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0 || *(volatile short*)(PAD0 + OFF_DPAD_LEFT)  > 0;
+            const bool right = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0 || *(volatile short*)(PAD0 + OFF_DPAD_RIGHT) > 0;
+            const bool press = (enter && !prevEnter) || (lmb && !prevLmb) || (cross && !prevCross);
+            const bool arrow = (left && !prevL) || (right && !prevR);
+            prevEnter = enter; prevLmb = lmb; prevCross = cross; prevL = left; prevR = right;
+
+            if (active && (press || arrow))
+            {
+                // o jogo pode ja ter reagido a este toque: usa onde o menu estava ~30 ms antes
+                int bp = page, bs = sel, bc = cntNow; bool got = false;
+                for (int k = 1; k <= 15 && k < histN + 1; ++k)
+                {
+                    const Snap& h = hist[(histN - k) & 15];
+                    if (h.t == 0) break;
+                    bp = h.page; bs = h.sel; bc = h.cnt; got = true;
+                    if (now - h.t >= 25) break;
+                }
+                if (!got) { bp = page; bs = sel; bc = cntNow; }
+                MenuClick(bp, bs, bc, !press);
+            }
         }
     }
     return 0;
 }
 
-// ---------------- Notification (on the game thread) ----------------
-// Replaces "call CHud::DrawHelpMessage": displays the pending message and then draws normally.
+// ---------------- Notificacao (na thread do jogo) ----------------
+// Substitui "call CHud::DrawHelpMessage": mostra a mensagem pendente e desenha normalmente.
 static void __cdecl HookDrawHelp()
 {
     int p = gPending;
     if (p)
     {
         gPending = 0;
-        ((SetHelp_t)FN_SETHELP)(p == 1 ? gTextOn : gTextOff, 1, 0, 0);   // Same call used by cheats
+        ((SetHelp_t)FN_SETHELP)(p == 1 ? gTextOn : gTextOff, 1, 0, 0);   // mesma chamada do cheat
     }
     ((Void_t)FN_DRAWHELP)();
 }
@@ -137,28 +660,50 @@ static void __cdecl HookDrawHelp()
 // ---------------- Turbo ----------------
 static int gLogPulse = 0;
 
-// Replaces "call CPad::UpdatePads" at the beginning of CGame::Process
+// Substitui "call CPad::UpdatePads" no inicio de CGame::Process
 static void __cdecl HookUpdatePads()
 {
-    ((Void_t)FN_UPDATEPADS)();                     // Let the game read the keyboard/controller normally
+    ((Void_t)FN_UPDATEPADS)();                     // o jogo le teclado/controle normalmente
 
     if (!gOn) return;
+    if (*(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE)) return;      // menu / pausa aberto: nada de pulsar o botao (conflita com o A do menu)
     volatile short* cross = (volatile short*)(PAD0 + OFF_CROSS);
-    if (*cross <= 0) return;                        // W / accelerate is not being held
+    if (*cross <= 0) return;                        // nao esta segurando W / acelerar
 
     void* veh = ((FindVeh_t)FN_FINDVEH)(-1, 0);
     if (!veh) return;
-    if (*(volatile int*)((uint8_t*)veh + OFF_SUBCLASS) != SUBCLASS_BMX) return;     // Bicycles only
+    if (*(volatile int*)((uint8_t*)veh + OFF_SUBCLASS) != SUBCLASS_BMX) return;     // so bicicleta
 
     unsigned frame = *(volatile unsigned*)FRAME_COUNTER;
-    if (((frame / gHalfFrames) & 1) != 0)           // Alternating frames: release the button
+    if (((frame / gHalfFrames) & 1) != 0)           // frames alternados: solta o botao
     {
         *cross = 0;
-        if (gLogPulse < 6) { ++gLogPulse; Log("Turbo active on bicycle (alternating accelerate button state)"); }
+        if (gLogPulse < 6) { ++gLogPulse; Log("Turbo ativo na bicicleta (alternando o botao de acelerar)"); }
     }
 }
 
-// ---------------- Installation ----------------
+// ---------------- Menu: texto da nossa linha ----------------
+// Substitui as chamadas a CText::Get dentro do desenho do menu: nossa chave devolve o texto atual.
+static char* __fastcall HookTextGet(void* self, void* /*edx*/, const char* key)
+{
+    if (key && strncmp(key, gMenuKey, 8) == 0)      // "BKTURBO" + NUL
+    {
+        static char label[256];
+        static int asked = 0;
+        ++gTextAsks;
+        BuildLabel(label, sizeof label);
+        if (gLog && asked < 3) { ++asked; Log("Menu: o jogo pediu o texto da nossa linha -> \"%s\"", label); }
+        return label;
+    }
+    if (gLog && key && *(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE) && *(volatile int8_t*)(FEM_ADDR + FEM_PAGE) == gCtrlPage)
+    {
+        static int seen = 0;
+        if (seen < 24) { ++seen; Log("Menu: texto pedido na tela Controller Setup: \"%.8s\"", key); }
+    }
+    return gOrigGet(self, key);
+}
+
+// ---------------- Instalacao ----------------
 static uintptr_t CallTarget(uintptr_t site)
 {
     uint8_t* c = (uint8_t*)site;
@@ -177,9 +722,145 @@ static bool WriteCall(uintptr_t at, void* target)
     return true;
 }
 
-static void ReadText(const char* key, const char* def, char* out, size_t cap)
+static void DumpScreen(int i, const MenuScreen& s)
 {
-    GetPrivateProfileStringA("BikeTurbo", key, def, out, (DWORD)cap, gIni);
+    Log("  tela %d \"%.8s\" prev=%d pai=%d", i, s.name, (int)s.prev, (int)s.parent);
+    for (int k = 0; k < 12 && (s.e[k].action || k < 5); ++k)
+        Log("    [%d] acao=%u chave=\"%.8s\" slot=%u destino=%d x=%u y=%u alin=%u", k, s.e[k].action, s.e[k].name,
+            s.e[k].slot, (int)s.e[k].target, s.e[k].x, s.e[k].y, s.e[k].align);
+}
+
+// Troca as chamadas a CText::Get dentro do desenho do menu pelo nosso filtro
+static int PatchTextCalls()
+{
+    uintptr_t targets[48]; int counts[48]; int nt = 0;
+    int patched = 0;
+    const uint8_t* base = (const uint8_t*)FN_DRAWSTD;
+    for (size_t i = 0; i + 5 <= DRAWSTD_SCAN; ++i)
+    {
+        if (base[i] != 0xE8) continue;
+        uintptr_t site = FN_DRAWSTD + i;
+        uintptr_t t = site + 5 + (uintptr_t)(intptr_t)(*(const int32_t*)(base + i + 1));
+        if (t < 0x401000 || t > 0x860000) continue;           // nao e codigo do exe
+        int j = 0;
+        while (j < nt && targets[j] != t) ++j;
+        if (j == nt && nt < 48) { targets[nt] = t; counts[nt] = 0; ++nt; }
+        if (j < nt) ++counts[j];
+        if (t == FN_TEXTGET && WriteCall(site, (void*)&HookTextGet)) { ++patched; i += 4; }
+    }
+    if (gLog)
+    {
+        Log("Chamadas mais frequentes em DrawStandardMenu (alvo: quantidade):");
+        for (int r = 0; r < 6; ++r)
+        {
+            int best = -1;
+            for (int j = 0; j < nt; ++j) if (counts[j] >= 0 && (best < 0 || counts[j] > counts[best])) best = j;
+            if (best < 0) break;
+            Log("    0x%X : %d", (unsigned)targets[best], counts[best]);
+            counts[best] = -1;
+        }
+        Log("Chamadas a CText::Get (0x%X) trocadas: %d", (unsigned)FN_TEXTGET, patched);
+    }
+    return patched;
+}
+
+// Acha o indice da tela Controller Setup: nome "FET_CTL" e, nas linhas, FEC_RED (Redefine Controls) e
+// FET_DEF (Restore Defaults) com UMA linha entre elas (Mouse Settings). Retorna -1 se nao for unico.
+static bool IsCtrlScreen(const MenuScreen& s)
+{
+    if (strncmp(s.name, "FET_CTL", 8) != 0) return false;
+    const int n = CountEntries(s);
+    int r = -1, d = -1;
+    for (int k = 0; k < n; ++k)
+    {
+        if (KeyIs(s.e[k], "FEC_RED")) r = k;
+        if (KeyIs(s.e[k], "FET_DEF")) d = k;
+    }
+    return r >= 0 && d == r + 2 && n <= 11;
+}
+
+static int FindCtrlIndex()
+{
+    const MenuScreen* S = (const MenuScreen*)ASCREENS_ADDR;
+    int found = -1, matches = 0;
+    for (int i = 0; i < MAX_SCREENS; ++i)
+        if (IsCtrlScreen(S[i])) { ++matches; found = i; Log("Menu: tela candidata %d", i); }
+    if (matches != 1) { Log("Menu: %d telas candidatas (preciso de exatamente 1).", matches); return -1; }
+    return found;
+}
+
+// Insere a nossa linha logo abaixo de Mouse Settings na tela S[found] (se ainda nao estiver la).
+// Y: se o Mouse tem Y fixo, a nova linha fica um passo abaixo; se for 0 ("logo abaixo da anterior"), tambem 0.
+// As linhas seguintes com Y fixo (Restore Defaults) descem um passo; as automaticas (Back) vao junto.
+static void PatchTable(MenuScreen* S, int found)
+{
+    MenuScreen& s = S[found];
+    const int n = CountEntries(s);
+    for (int k = 0; k < n; ++k) if (KeyIs(s.e[k], gMenuKey)) return;      // ja inserida
+    int r = -1, iDef = -1;
+    for (int k = 0; k < n; ++k)
+    {
+        if (KeyIs(s.e[k], "FEC_RED")) r = k;
+        if (KeyIs(s.e[k], "FET_DEF")) iDef = k;
+    }
+    if (r < 0 || iDef != r + 2 || n > 11) { Log("Menu: tabela em 0x%08X nao tem o formato esperado.", (unsigned)(uintptr_t)&s); return; }
+
+    Log("Menu: tela %d em 0x%08X antes da alteracao:", found, (unsigned)(uintptr_t)&s);
+    if (gLog) DumpScreen(found, s);
+
+    DWORD old;
+    if (!VirtualProtect(&s, sizeof(MenuScreen), PAGE_READWRITE, &old)) { Log("Menu: VirtualProtect falhou."); return; }
+
+    MenuEntry nw = s.e[iDef - 1];                         // copia de "Mouse Settings": mesmo X, alinhamento
+    memset(nw.name, 0, sizeof nw.name);
+    memcpy(nw.name, gMenuKey, 7);
+    nw.action = (uint8_t)gMenuAction;
+    nw.slot = s.e[iDef].slot;                             // mesmo "slot" das linhas normais
+    nw.target = (int8_t)found;                            // acao 5 = ir para a tela do destino: a mesma
+    if (nw.y != 0) nw.y = (uint16_t)(nw.y + gMenuStep);
+
+    for (int k = n; k > iDef; --k) s.e[k] = s.e[k - 1];   // Restore Defaults e Back descem uma linha
+    s.e[iDef] = nw;
+    for (int k = iDef + 1; k <= n; ++k)
+        if (s.e[k].y != 0) s.e[k].y = (uint16_t)(s.e[k].y + gMenuStep);
+    DWORD tmp;
+    VirtualProtect(&s, sizeof(MenuScreen), old, &tmp);
+
+    Log("Menu: linha inserida na tela %d (entrada %d). Novo layout:", found, iDef);
+    if (gLog) DumpScreen(found, s);
+}
+
+// Procura na memoria privada (heap) uma copia gravavel da tela Controller Setup; devolve a base da copia
+// (tela numero gCtrlPage esta em base[gCtrlPage]).
+static MenuScreen* FindLive()
+{
+    static const char pat[8] = { 'F','E','T','_','C','T','L','\0' };
+    uintptr_t a = 0x10000;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (a < 0x7FFE0000 && VirtualQuery((void*)a, &mbi, sizeof mbi) == sizeof mbi)
+    {
+        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && mbi.Protect == PAGE_READWRITE &&
+            mbi.RegionSize > sizeof(MenuScreen))
+        {
+            const uint8_t* p = (const uint8_t*)lo;
+            const size_t lim = mbi.RegionSize - sizeof(MenuScreen);
+            size_t i = 0;
+            while (i <= lim)
+            {
+                const uint8_t* q = (const uint8_t*)memchr(p + i, 'F', lim - i + 1);
+                if (!q) break;
+                i = (size_t)(q - p);
+                if (memcmp(q, pat, 8) == 0 && IsCtrlScreen(*(const MenuScreen*)q) &&
+                    (uintptr_t)q >= lo + (uintptr_t)gCtrlPage * sizeof(MenuScreen))
+                    return (MenuScreen*)(q - (uintptr_t)gCtrlPage * sizeof(MenuScreen));
+                ++i;
+            }
+        }
+        if (hi <= a) break;
+        a = hi;
+    }
+    return NULL;
 }
 
 BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
@@ -191,13 +872,19 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
     GetModuleFileNameA(hm, gIni, MAX_PATH);
     char* dot = strrchr(gIni, '.');
     if (dot) strcpy(dot, ".ini"); else strcat(gIni, ".ini");
+    IniLoad(gIni);
 
-    gLog = GetPrivateProfileIntA("BikeTurbo", "Log", 0, gIni) != 0;
-    if (!GetPrivateProfileIntA("BikeTurbo", "Enable", 1, gIni)) { Log("Disabled in .ini"); return TRUE; }
+    gLog = IniInt("Log", 0) != 0;
+    if (!IniInt("Enable", 1)) { Log("Desativado no .ini"); return TRUE; }
 
-    if (*(uint32_t*)VERSION_ADDR != VERSION_OK) { Log("Unrecognized executable version (expected 1.0 US). Mod disabled."); return TRUE; }
+    if (*(uint32_t*)VERSION_ADDR != VERSION_OK) { Log("Versao do exe nao reconhecida (esperado 1.0 US). Mod desativado."); return TRUE; }
 
-    // Read the cheat code: letters A-Z only, 4 to 20 characters
+    // Conversao de caracteres (UTF-8 -> bytes do jogo)
+    int cpv = IniInt("CharCodePage", 1252);
+    if (cpv > 0) gCodePage = (UINT)cpv;
+    IniEach(CharMapCb, NULL);
+
+    // Texto do codigo: so letras A-Z, 4 a 20 caracteres
     char code[32];
     ReadText("Code", "BIKETURBO", code, sizeof code);
     int k = 0;
@@ -211,25 +898,51 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
 
     ReadText("TextOn",  "Bike Turbo On",  gTextOn,  sizeof gTextOn);
     ReadText("TextOff", "Bike Turbo Off", gTextOff, sizeof gTextOff);
+    ReadText("MenuText",   "Bike Turbo",      gMenuText, sizeof gMenuText);
+    ReadText("MenuYes",    "Yes",             gMenuYes,  sizeof gMenuYes);
+    ReadText("MenuNo",     "No",              gMenuNo,   sizeof gMenuNo);
+    ReadText("MenuFormat", "{text}: {value}", gMenuFmt,  sizeof gMenuFmt);
+    gMenuAction = IniInt("MenuAction", 254);
+    if (gMenuAction < 1 || gMenuAction > 255) gMenuAction = 254;
+    gMenuStep = IniInt("MenuRowStep", 30);
+    if (gMenuStep < 1 || gMenuStep > 100) gMenuStep = 30;
 
-    int frames = GetPrivateProfileIntA("BikeTurbo", "TapFrames", 1, gIni);
+    int frames = IniInt("TapFrames", 1);
     if (frames < 1) frames = 1;
     if (frames > 30) frames = 30;
     gHalfFrames = (unsigned)frames;
-    gOn = GetPrivateProfileIntA("BikeTurbo", "StartEnabled", 0, gIni) != 0;
+    gOn = IniInt("StartEnabled", 0) != 0;
+    gSaveChoice = IniInt("SaveChoice", 1) != 0;
+    if (gSaveChoice) { bool sv; if (LoadState(sv)) gOn = sv; }       // a escolha salva vale mais que StartEnabled
 
-    // Verify the game's code before modifying anything
+    // Confere o codigo do jogo antes de alterar qualquer coisa
     bool ok = true;
     if (CallTarget(SITE_UPDPADS) != FN_UPDATEPADS) ok = false;
     if (CallTarget(SITE_DRAWHELP) != FN_DRAWHELP) ok = false;
     static const uint8_t setHelp[6] = { 0xA0, 0xC0, 0xAE, 0xBA, 0x00, 0x84 };
     if (memcmp((void*)FN_SETHELP, setHelp, sizeof setHelp) != 0) ok = false;
-    if (!ok) { Log("Game code differs from expected. Another mod may have modified these locations. Mod disabled."); return TRUE; }
+    if (!ok) { Log("Codigo do jogo diferente do esperado. Outro mod pode ter alterado essas areas. Mod desativado."); return TRUE; }
 
     bool a = WriteCall(SITE_UPDPADS, (void*)&HookUpdatePads);
     bool b = WriteCall(SITE_DRAWHELP, (void*)&HookDrawHelp);
+
+    // Opcao no menu: so se os dois passos abaixo derem certo (primeiro o filtro de texto, depois a tabela)
+    bool menu = false;
+    if (!IniInt("HideMenuOption", 0))
+    {
+        gOrigGet = (TextGet_t)FN_TEXTGET;
+        if (PatchTextCalls() > 0)
+        {
+            const int idx = FindCtrlIndex();
+            if (idx >= 0) { gCtrlPage = idx; PatchTable((MenuScreen*)ASCREENS_ADDR, idx); menu = true; }
+        }
+        else Log("Menu: nenhuma chamada a CText::Get encontrada no desenho do menu. Opcao do menu desativada.");
+        gMenuReady = menu;
+    }
+
     CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
-    Log("Enabled: code=%s, %u frame(s) per half-tap, initially enabled=%d. Patch: pad=%s, message=%s",
-        gCode, gHalfFrames, (int)gOn, a ? "OK" : "FAILED", b ? "OK" : "FAILED");
+    if (menu && IniInt("MouseWheel", 1)) CreateThread(NULL, 0, WheelThread, NULL, 0, NULL);
+    Log("Ativo: codigo=%s, %u frame(s) por meio-toque, turbo inicial=%d, menu=%d, codepage=%u. Patch: pad=%s, mensagem=%s",
+        gCode, gHalfFrames, (int)gOn, (int)menu, (unsigned)gCodePage, a ? "OK" : "FALHOU", b ? "OK" : "FALHOU");
     return TRUE;
 }
