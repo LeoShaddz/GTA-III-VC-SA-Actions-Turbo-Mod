@@ -1,10 +1,14 @@
-# GTA San Andreas Bike Turbo Mod
+# GTA San Andreas Actions Turbo Mod
 
-When activated, this mod makes the game register holding down the 'W' key (or the 'A' button on a controller) while on a bike as if you were pressing it repeatedly in quick succession, causing CJ to pedal rapidly. It acts like a turbo, but exclusively for the bike.
+This mod adds a "turbo" effect to certain in-game actions, such as pedaling a bicycle faster, performing melee attacks, and training at the gym.
 
-To enable or disable the mod, you can do this in the game's control options or type "BIKETURBO" during the gameplay.
+To enable or disable the mod, you can do this in the game's controller setup or type "ATURBO" during the gameplay.
 
-The new text in the game's controls options can be customized via the .ini file, in case you wish to translate it into another language.
+This mod is customizable, in the .ini file, you can disable the turbo for each action individually, in case you want it enabled for one action but not for another.
+
+The new text in the game's controls options can be customized via the .ini file, in case you wish to translate it into another language.
+
+This is the old "Bike Turbo" mod, expanded and renamed
 
 # AI disclosure
 The code of this mod was written by Claude Sonnet 5.5 and tested in-game by me.
