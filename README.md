@@ -2,7 +2,7 @@
 
 This is the old "Bike Turbo" mod, expanded and renamed.
 
-This mod adds a "turbo" effect to certain in-game actions, such as pedaling a bicycle faster, performing melee attacks, and training at the gym. 
+This mod adds a "turbo" effect to certain in-game actions, such as pedaling a bicycle faster, performing melee attacks, and training at the gym. For III and VC, it’s melee-only, since those games don’t have bicycles or gyms.
 
 In other words, actions that previously required pressing the button multiple times can now be performed by holding the button down.
 
