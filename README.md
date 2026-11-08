@@ -6,7 +6,7 @@ This mod adds a "turbo" effect to certain in-game actions, such as pedaling a bi
 
 To enable or disable the mod, you can do this in the game's controller setup or type "ATURBO" during the gameplay.
 
-This mod is customizable, in the .ini file, you can disable the turbo for each action individually, in case you want it enabled for one action but not for another.
+This mod is customizable, in the .ini file, you can disable the turbo for each action individually, in case you want to disable it for just one action while keeping the others enabled.
 
 The new text in the game's controls options can be customized via the .ini file, in case you wish to translate it into another language.
 
