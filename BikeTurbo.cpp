@@ -44,6 +44,21 @@ static const uintptr_t FN_FINDVEH    = 0x56E0D0;
 static const int       OFF_SUBCLASS  = 0x594;
 static const int       SUBCLASS_BMX  = 10;
 
+// ---- Turbo de socos (MeleeTurbo=1 no .ini) ----
+// Confirmado no gta_sa.exe 1.0 US: FindPlayerPed = 0x56E210 (cdecl, -1 = jogador em foco); CPed::m_nActiveWeaponSlot = ped+0x718 (byte);
+// CPed::m_aWeapons = ped+0x5A0, 0x1C bytes cada, tipo da arma no +0. Tipos 0..15 = punho e armas brancas.
+// CPad::DisablePlayerControls = pad+0x10E (word).
+static const uintptr_t FN_FINDPED       = 0x56E210;
+static const int       OFF_ACTIVESLOT   = 0x718;
+static const int       OFF_WEAPONS      = 0x5A0;
+static const int       WEAPON_STRIDE    = 0x1C;
+static const int       OFF_PADDISABLE   = 0x10E;
+static const int       OFF_TRIANGLE     = 0x1E;     // Y / F: golpe alternativo (com a mira apertada)
+static const int       OFF_R1           = 0x0C;     // RB / botao direito do mouse: mira
+static volatile bool   gGym             = false;    // GymTurbo
+static volatile bool   gMelee           = false;    // MeleeTurbo
+static int             gMeleeFireOff    = 0x22;     // MeleeFireButton (padrao Circle = B / botao esquerdo do mouse)
+
 // ---- Menu ----
 static const uintptr_t FEM_ADDR      = 0xBA6748;   // FrontEndMenuManager
 static const int       FEM_SELECTED  = 0x54;       // int  : entrada selecionada
@@ -661,12 +676,195 @@ static void __cdecl HookDrawHelp()
 static int gLogPulse = 0;
 
 // Substitui "call CPad::UpdatePads" no inicio de CGame::Process
+// Socos / armas brancas: com o turbo ligado, segurar o botao de ataque (B / botao do mouse) ou, mirando, o golpe alternativo
+// (Y / F) repete o toque. So a pe, so com punho ou arma branca na mao, e so se os controles nao estiverem desativados.
+// Retorna true se tratou este frame (o jogador esta em condicoes de socar).
+static bool MeleeTurbo()
+{
+    if (*(volatile uint16_t*)(PAD0 + OFF_PADDISABLE) != 0) return false;           // cutscene / loja / controles desativados
+    volatile short* fire = (volatile short*)(PAD0 + gMeleeFireOff);
+    volatile short* tri  = (volatile short*)(PAD0 + OFF_TRIANGLE);
+    volatile short* aim  = (volatile short*)(PAD0 + OFF_R1);
+    const bool a = *fire > 0;                                  // ataque padrao
+    const bool b = *tri > 0 && *aim > 0;                       // golpe alternativo: mira + Y / F
+    if (!a && !b) return false;
+
+    if (((FindVeh_t)FN_FINDVEH)(-1, 0)) return false;          // dentro de veiculo: nada
+    uint8_t* ped = ((uint8_t* (__cdecl*)(int))FN_FINDPED)(-1);
+    if (!ped) return false;
+    const unsigned slot = ped[OFF_ACTIVESLOT];
+    if (slot > 12) return false;
+    const int type = *(volatile int*)(ped + OFF_WEAPONS + slot * WEAPON_STRIDE);
+    if (type < 0 || type > 15) return false;                   // so punho (0) e armas brancas (1..15)
+
+    static int logged = 0;
+    const unsigned frame = *(volatile unsigned*)FRAME_COUNTER;
+    if (((frame / gHalfFrames) & 1) != 0)                      // frames alternados: solta
+    {
+        if (a) *fire = 0;
+        if (b) *tri = 0;
+        if (logged < 6) { ++logged; Log("MeleeTurbo: arma %d, ataque=%d alternativo=%d (alternando o botao)", type, (int)a, (int)b); }
+    }
+    return true;
+}
+
+
+// ---------------- Academia (GymTurbo) ----------------
+// O minigame da academia e feito por script; o jogo so toca animacoes do pacote "gymnasium" no jogador.
+// Detecta isso olhando as animacoes ativas do jogador: se alguma pertence ao bloco "gymnasium", ele esta num aparelho.
+//   esteira / bicicleta ergometrica (gym_tread_*, gym_bike_*): segurar A / Espaco repete o toque de Cross.
+//   pesos: segurar A ou B (Espaco ou botao esquerdo) alterna Cross e Circle, como se voce apertasse A + B.
+static const uintptr_t FN_GETANIMBLOCK = 0x4D3940;   // CAnimManager::GetAnimationBlock(name)
+static const uintptr_t FN_FIRSTASSOC   = 0x4D15E0;   // RpAnimBlendClumpGetFirstAssociation(clump)
+static const uintptr_t FN_UPKEY        = 0x53CF30;   // CKeyGen::GetUppercaseKey(str)
+static const uintptr_t ADDR_ANIMS_PTR  = 0xB4EA34;   // CAnimManager::ms_aAnimations
+static const int       OFF_PED_CLUMP   = 0x18;
+static const int       OFF_ASSOC_NEXT  = 0x4;        // link.next (aponta para o link do proximo; associacao = link - 4)
+static const int       OFF_ASSOC_GROUP = 0xE;
+static const int       OFF_ASSOC_HIER  = 0x14;       // CAnimBlendHierarchy*
+static const int       OFF_BLK_LOADED  = 0x10, OFF_BLK_FIRST = 0x14, OFF_BLK_COUNT = 0x18;
+
+// animacoes de esteira e bicicleta (comparadas pelo hash do nome, maiusculas)
+static const char* const kCardio[] = {
+    "gym_bike_celebrate","gym_bike_fast","gym_bike_faster","gym_bike_getoff","gym_bike_geton","gym_bike_pedal","gym_bike_slow","gym_bike_still",
+    "gym_tread_falloff","gym_tread_geton","gym_tread_getoff","gym_tread_jog","gym_tread_sprint","gym_tread_tired","gym_tread_walk" };
+static unsigned gCardioHash[16]; static int gNCardio = 0;
+
+// Procura, nos primeiros 0x30 bytes da associacao, um ponteiro para uma hierarquia do bloco "gymnasium"
+// (tolera o deslocamento do campo estar errado). Devolve o ponteiro e o deslocamento achado.
+static uint8_t* AssocGymHier(uint8_t* a, uintptr_t lo, uintptr_t hi, int* offFound)
+{
+    for (int off = 0; off < 0x30; off += 4)
+    {
+        uintptr_t v = *(uintptr_t*)(a + off);
+        if (v >= lo && v < hi && ((v - lo) % 0x14) == 0) { if (offFound) *offFound = off; return (uint8_t*)v; }
+    }
+    return 0;
+}
+
+// 0 = fora de aparelho, 1 = pesos, 2 = esteira / bicicleta
+static int GymMode(uint8_t* ped)
+{
+    uint8_t* blk = ((uint8_t* (__cdecl*)(const char*))FN_GETANIMBLOCK)("gymnasium");
+    const bool loaded = blk && blk[OFF_BLK_LOADED];     // nos pesos o pacote pode ainda nao constar como carregado
+    const unsigned first = loaded ? *(unsigned*)(blk + OFF_BLK_FIRST) : 0, cnt = loaded ? *(unsigned*)(blk + OFF_BLK_COUNT) : 0;
+    uint8_t* hierBase = *(uint8_t**)ADDR_ANIMS_PTR;
+    void* clump = *(void**)(ped + OFF_PED_CLUMP);
+    if (!hierBase || !clump || cnt > 4096) return 0;
+    // Medido no log: durante qualquer exercicio o jogo marca "controles desativados" com o bit 0x20 (valor 32)
+    const bool gymCtl = (*(volatile uint16_t*)(PAD0 + OFF_PADDISABLE) & 0x20) != 0;
+
+    const uintptr_t lo = (uintptr_t)hierBase + (uintptr_t)first * 0x14, hi = lo + (uintptr_t)cnt * 0x14;
+    uint8_t* a = ((uint8_t* (__cdecl*)(void*))FN_FIRSTASSOC)(clump);
+    int mode = 0;
+    for (int n = 0; a && n < 64; ++n)
+    {
+        int off = -1;
+        uint8_t* h = AssocGymHier(a, lo, hi, &off);
+        // Medido no log: as animacoes tocadas pelo script da academia tem grupo = 0xFFFF (+0xE) e o pacote "gymnasium" carregado.
+        const unsigned short group = *(unsigned short*)(a + OFF_ASSOC_GROUP);
+        uint8_t* hp = *(uint8_t**)(a + OFF_ASSOC_HIER);
+        if (h || (group == 0xFFFF && gymCtl))
+        {
+            if (!mode) mode = 1;
+            if (!h) h = hp;
+            unsigned hash = 0;
+            if ((uintptr_t)h > 0x400000 && (uintptr_t)h < 0x7FFF0000) hash = *(unsigned*)h;
+            for (int k = 0; k < gNCardio; ++k) if (gCardioHash[k] == hash) mode = 2;
+            static int logged = 0;
+            if (gLog && logged < 40) { ++logged; Log("GymTurbo: animacao de script durante exercicio: grupo=%04X hier=%p hash=%08X flags=%04X (modo %d)", (unsigned)group, h, hash, (unsigned)(*(unsigned*)(a + 0x2C) >> 16), mode); }
+        }
+        uint8_t* nx = *(uint8_t**)(a + OFF_ASSOC_NEXT);
+        a = nx ? nx - 4 : 0;
+    }
+    return mode;
+}
+
+static bool GymTurbo()
+{
+    volatile short* cross  = (volatile short*)(PAD0 + OFF_CROSS);
+    volatile short* circle = (volatile short*)(PAD0 + 0x22);
+    const bool a = *cross > 0, b = *circle > 0;
+    if (!a && !b) return false;
+    if (((FindVeh_t)FN_FINDVEH)(-1, 0)) return false;
+    uint8_t* ped = ((uint8_t* (__cdecl*)(int))FN_FINDPED)(-1);
+    if (!ped) return false;
+    const int mode = GymMode(ped);
+    if (!mode) return false;
+
+    const unsigned frame = *(volatile unsigned*)FRAME_COUNTER;
+    const bool odd = ((frame / gHalfFrames) & 1) != 0;
+    static int logged = 0;
+    if (mode == 2)                                   // esteira / bicicleta: so Cross, so se A / Espaco estiver segurado
+    {
+        if (!a) return true;
+        if (odd) *cross = 0;
+    }
+    else                                             // pesos: alterna Cross e Circle enquanto qualquer um estiver segurado
+    {
+        if (odd) { *cross = 0; *circle = 255; }
+        else     { *cross = 255; *circle = 0; }
+    }
+    if (logged < 6) { ++logged; Log("GymTurbo: aparelho (modo %d: %s), alternando o botao", mode, mode == 2 ? "esteira/bicicleta" : "pesos"); }
+    return true;
+}
+
+
+// Diagnostico do GymTurbo (so com Log=1): a cada ~30 frames registra, quando algo muda, o estado que a deteccao enxerga.
+static void GymDiag()
+{
+    static int lines = 0; static unsigned nextF = 0; static unsigned long long lastSig = 0;
+    const unsigned frame = *(volatile unsigned*)FRAME_COUNTER;
+    if (lines >= 160 || frame < nextF) return;
+    nextF = frame + 30;
+    uint8_t* ped = ((uint8_t* (__cdecl*)(int))FN_FINDPED)(-1);
+    if (!ped) return;
+    uint8_t* blk = ((uint8_t* (__cdecl*)(const char*))FN_GETANIMBLOCK)("gymnasium");
+    uint8_t* hierBase = *(uint8_t**)ADDR_ANIMS_PTR;
+    void* clump = *(void**)(ped + OFF_PED_CLUMP);
+    unsigned long long sig = 1469598103934665603ULL;
+    char buf[1400]; int o = 0;
+    o += _snprintf(buf + o, sizeof buf - o, "blk=%p loaded=%d first=%u cnt=%u clump=%p veh=%d dis=%u cross=%d circle=%d | assocs:",
+        blk, blk ? (int)blk[OFF_BLK_LOADED] : -1, blk ? *(unsigned*)(blk + OFF_BLK_FIRST) : 0, blk ? *(unsigned*)(blk + OFF_BLK_COUNT) : 0,
+        clump, ((FindVeh_t)FN_FINDVEH)(-1, 0) ? 1 : 0, (unsigned)*(volatile uint16_t*)(PAD0 + OFF_PADDISABLE),
+        (int)*(volatile short*)(PAD0 + OFF_CROSS), (int)*(volatile short*)(PAD0 + 0x22));
+    if (clump && hierBase)
+    {
+        const unsigned first = blk ? *(unsigned*)(blk + OFF_BLK_FIRST) : 0, cnt = blk ? *(unsigned*)(blk + OFF_BLK_COUNT) : 0;
+        const uintptr_t lo = (uintptr_t)hierBase + (uintptr_t)first * 0x14, hi = lo + (uintptr_t)cnt * 0x14;
+        o += _snprintf(buf + o, sizeof buf - o, " base=%p range=%08X-%08X", hierBase, (unsigned)lo, (unsigned)hi);
+        uint8_t* a = ((uint8_t* (__cdecl*)(void*))FN_FIRSTASSOC)(clump);
+        for (int n = 0; a && n < 8 && o < 1250; ++n)
+        {
+            int off = -1;
+            uint8_t* h = AssocGymHier(a, lo, hi, &off);
+            o += _snprintf(buf + o, sizeof buf - o, " {a=%p", a);
+            for (int w = 0; w < 12; ++w) o += _snprintf(buf + o, sizeof buf - o, " %X", *(unsigned*)(a + w * 4));
+            if (h) o += _snprintf(buf + o, sizeof buf - o, " GYM campo=+0x%X hash=%08X", off, *(unsigned*)h);
+            { uint8_t* hp = *(uint8_t**)(a + OFF_ASSOC_HIER);
+              if ((uintptr_t)hp > 0x400000 && (uintptr_t)hp < 0x7FFF0000)
+                  o += _snprintf(buf + o, sizeof buf - o, " H=%X,%X,%X,%X,%X", *(unsigned*)hp, *(unsigned*)(hp+4), *(unsigned*)(hp+8), *(unsigned*)(hp+12), *(unsigned*)(hp+16)); }
+            o += _snprintf(buf + o, sizeof buf - o, "}");
+            sig = (sig ^ (unsigned long long)(uintptr_t)a) * 1099511628211ULL; sig = (sig ^ (h ? 1u : 0u)) * 1099511628211ULL;
+            uint8_t* nx = *(uint8_t**)(a + OFF_ASSOC_NEXT);
+            a = nx ? nx - 4 : 0;
+        }
+    }
+    sig ^= (unsigned long long)(blk != 0) + ((unsigned long long)(blk && blk[OFF_BLK_LOADED]) << 1);
+    if (sig == lastSig) return;
+    lastSig = sig; ++lines;
+    Log("GymDiag: %s", buf);
+}
+
 static void __cdecl HookUpdatePads()
 {
     ((Void_t)FN_UPDATEPADS)();                     // o jogo le teclado/controle normalmente
 
+    if (gGym && gLog) GymDiag();
     if (!gOn) return;
     if (*(volatile uint8_t*)(FEM_ADDR + FEM_ACTIVE)) return;      // menu / pausa aberto: nada de pulsar o botao (conflita com o A do menu)
+    if (gGym && GymTurbo()) return;
+    if (gMelee && MeleeTurbo()) return;
     volatile short* cross = (volatile short*)(PAD0 + OFF_CROSS);
     if (*cross <= 0) return;                        // nao esta segurando W / acelerar
 
@@ -913,6 +1111,19 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
     gHalfFrames = (unsigned)frames;
     gOn = IniInt("StartEnabled", 0) != 0;
     gSaveChoice = IniInt("SaveChoice", 1) != 0;
+    gMelee = IniInt("MeleeTurbo", 0) != 0;
+    gGym = IniInt("GymTurbo", 0) != 0;
+    for (const char* nm : kCardio)
+        if (gNCardio < 16) gCardioHash[gNCardio++] = ((unsigned (__cdecl*)(const char*))FN_UPKEY)(nm);
+    {
+        char fb[32];
+        if (IniGet("BikeTurbo", "MeleeFireButton", fb, sizeof fb) && fb[0])
+        {
+            static const struct { const char* n; int off; } fbs[] = { {"Circle",0x22},{"Cross",0x20},{"Square",0x1C},{"Triangle",0x1E},
+                                                                       {"R1",0x0C},{"L1",0x08},{"R2",0x0E},{"L2",0x0A} };
+            for (const auto& e : fbs) if (_stricmp(fb, e.n) == 0) gMeleeFireOff = e.off;
+        }
+    }
     if (gSaveChoice) { bool sv; if (LoadState(sv)) gOn = sv; }       // a escolha salva vale mais que StartEnabled
 
     // Confere o codigo do jogo antes de alterar qualquer coisa
@@ -942,6 +1153,8 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
 
     CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
     if (menu && IniInt("MouseWheel", 1)) CreateThread(NULL, 0, WheelThread, NULL, 0, NULL);
+    Log("GymTurbo=%d", (int)gGym);
+    Log("MeleeTurbo=%d (botao de ataque no offset 0x%X)", (int)gMelee, gMeleeFireOff);
     Log("Ativo: codigo=%s, %u frame(s) por meio-toque, turbo inicial=%d, menu=%d, codepage=%u. Patch: pad=%s, mensagem=%s",
         gCode, gHalfFrames, (int)gOn, (int)menu, (unsigned)gCodePage, a ? "OK" : "FALHOU", b ? "OK" : "FALHOU");
     return TRUE;
