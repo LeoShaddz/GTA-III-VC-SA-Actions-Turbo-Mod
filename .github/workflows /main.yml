@@ -1,4 +1,4 @@
-name: Build BikeTurbo ASI
+name: Build BikeTurbo and MeleeTurbo ASIs
 
 on:
   push:
@@ -14,18 +14,25 @@ jobs:
         with:
           arch: x86
 
-      - name: Compile
+      - name: Compile BikeTurbo (SA), MeleeTurboVC and MeleeTurboIII
         shell: pwsh
         run: |
-          $src = Get-ChildItem -Recurse -Filter BikeTurbo.cpp | Select-Object -First 1
-          if (-not $src) { throw "BikeTurbo.cpp nao encontrado" }
-          Set-Location $src.DirectoryName
-          cl /nologo /LD /O2 /MT /EHsc BikeTurbo.cpp /Fe:BikeTurbo.asi /link /DYNAMICBASE:NO user32.lib
-          if ($LASTEXITCODE -ne 0) { throw "Falha na compilacao" }
+          foreach ($name in @("BikeTurbo", "MeleeTurboVC", "MeleeTurboIII")) {
+            $src = Get-ChildItem -Recurse -Filter "$name.cpp" | Select-Object -First 1
+            if (-not $src) { throw "$name.cpp nao encontrado" }
+            Push-Location $src.DirectoryName
+            cl /nologo /LD /O2 /MT /EHsc /D_CRT_SECURE_NO_WARNINGS "$name.cpp" "/Fe:$name.asi" /link user32.lib kernel32.lib
+            if ($LASTEXITCODE -ne 0) { throw "Falha na compilacao: $name" }
+            Pop-Location
+          }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: BikeTurbo
+          name: BikeTurbo-MeleeTurbo
           path: |
             **/BikeTurbo.asi
+            **/MeleeTurboVC.asi
+            **/MeleeTurboIII.asi
             **/BikeTurbo.ini
+            **/MeleeTurboVC.ini
+            **/MeleeTurboIII.ini
