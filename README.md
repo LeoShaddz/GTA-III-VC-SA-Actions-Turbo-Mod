@@ -12,6 +12,29 @@ This mod is customizable, in the .ini file, you can disable the turbo for each a
 
 The new text in the game's controls options can be customized via the .ini file, in case you wish to translate it into another language.
 
+# Installation 
+
+**III**: 
+
+1. Install the Ultimate Asi Loader and Modloader in in the game's root folder
+2. Extract the file "GTA.III.Melee.Turbo.Mod.v1.0.zip"
+3. Copy the "Melee Turbo" folder into the "modloader" folder, which is located in your game's root directory.
+4. Done
+
+**VC**:
+
+1. Install the Ultimate Asi Loader and Modloader in in the game's root folder
+2. Extract the file "GTA.VC.Melee.Turbo.Mod.v1.0.zip"
+3. Copy the "Melee Turbo" folder into the "modloader" folder, which is located in your game's root directory.
+4. Done
+
+**SA**: 
+
+1. Install the Silent's Asi Loader and Modloader in in the game's root folder
+2. Extract the file "GTA.SA.Actions.Turbo.Mod.v1.2.zip"
+3. Copy the "Actions Turbo" folder into the "modloader" folder, which is located in your game's root directory.
+4. Done
+
 # AI disclosure
 The code of this mod was written by Claude Sonnet 5.5 and tested in-game by me.
 
