@@ -1,4 +1,4 @@
-# GTA San Andreas Actions Turbo Mod
+# GTA III / Vice City/ San Andreas Actions Turbo Mod
 
 This is the old "Bike Turbo" mod, expanded and renamed.
 
