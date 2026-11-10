@@ -443,6 +443,18 @@ static DWORD WINAPI WheelThread(LPVOID)
     return 0;
 }
 
+// Confere e reaplica na copia viva, com SEH. false = a copia sumiu.
+static bool LivePatch()
+{
+    __try
+    {
+        if (strncmp(gLive[gCtrlPage].name, "FET_CTL", 8) != 0) return false;
+        PatchTable(gLive, gCtrlPage);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // Garante que a copia do jogo (se existir) tambem tenha a nossa linha, e reaplica se alguem a refizer.
 static void EnsureLive()
 {
@@ -456,9 +468,8 @@ static void EnsureLive()
     if (!MenuOpen()) return;
     if (gLive)
     {
-        if (IsBadReadPtr(gLive + gCtrlPage, sizeof(MenuScreen)) || strncmp(gLive[gCtrlPage].name, "FET_CTL", 8) != 0)
-        { Log("Menu: a copia das telas sumiu; procurando de novo."); gLive = NULL; return; }
-        PatchTable(gLive, gCtrlPage);                     // so age se a linha nao estiver la
+        if (!LivePatch())
+        { Log("Menu: a copia das telas sumiu; procurando de novo."); gLive = NULL; }
         return;
     }
     const DWORD now = GetTickCount();
@@ -774,11 +785,35 @@ static void PatchTable(MenuScreen* S, int found)
     if (gLog) DumpScreen(found, s);
 }
 
+// Varre UMA regiao, com SEH: o jogo pode liberar essa memoria enquanto lemos (ex.: ao minimizar e voltar).
+static MenuScreen* ScanRegion(uintptr_t lo, size_t size)
+{
+    static const char pat[8] = { 'F','E','T','_','C','T','L','\0' };
+    MenuScreen* result = NULL;
+    __try
+    {
+        const uint8_t* p = (const uint8_t*)lo;
+        const size_t lim = size - sizeof(MenuScreen);
+        size_t i = 0;
+        while (i <= lim)
+        {
+            const uint8_t* q = (const uint8_t*)memchr(p + i, 'F', lim - i + 1);
+            if (!q) break;
+            i = (size_t)(q - p);
+            if (memcmp(q, pat, 8) == 0 && IsCtrlScreen(*(const MenuScreen*)q) &&
+                (uintptr_t)q >= lo + (uintptr_t)gCtrlPage * sizeof(MenuScreen))
+            { result = (MenuScreen*)(q - (uintptr_t)gCtrlPage * sizeof(MenuScreen)); break; }
+            ++i;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { result = NULL; }
+    return result;
+}
+
 // Procura na memoria privada (heap) uma copia gravavel da tela Controller Setup; devolve a base da copia
 // (tela numero gCtrlPage esta em base[gCtrlPage]).
 static MenuScreen* FindLive()
 {
-    static const char pat[8] = { 'F','E','T','_','C','T','L','\0' };
     uintptr_t a = 0x10000;
     MEMORY_BASIC_INFORMATION mbi;
     while (a < 0x7FFE0000 && VirtualQuery((void*)a, &mbi, sizeof mbi) == sizeof mbi)
@@ -787,19 +822,8 @@ static MenuScreen* FindLive()
         if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && mbi.Protect == PAGE_READWRITE &&
             mbi.RegionSize > sizeof(MenuScreen))
         {
-            const uint8_t* p = (const uint8_t*)lo;
-            const size_t lim = mbi.RegionSize - sizeof(MenuScreen);
-            size_t i = 0;
-            while (i <= lim)
-            {
-                const uint8_t* q = (const uint8_t*)memchr(p + i, 'F', lim - i + 1);
-                if (!q) break;
-                i = (size_t)(q - p);
-                if (memcmp(q, pat, 8) == 0 && IsCtrlScreen(*(const MenuScreen*)q) &&
-                    (uintptr_t)q >= lo + (uintptr_t)gCtrlPage * sizeof(MenuScreen))
-                    return (MenuScreen*)(q - (uintptr_t)gCtrlPage * sizeof(MenuScreen));
-                ++i;
-            }
+            MenuScreen* r = ScanRegion(lo, mbi.RegionSize);
+            if (r) return r;
         }
         if (hi <= a) break;
         a = hi;
